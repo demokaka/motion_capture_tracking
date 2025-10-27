@@ -1,6 +1,13 @@
 #include <iostream>
 #include <vector>
 
+#include <Eigen/Geometry>
+#include <cmath>
+#include <deque>
+
+#include <fstream>
+#include <iomanip>
+
 // ROS
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -47,6 +54,36 @@ std::vector<double> get_vec(const rclcpp::ParameterValue& param_value)
     return result;
   }
   return param_value.get<std::vector<double>>();
+}
+
+Eigen::Vector3f quaternionToEuler(const Eigen::Quaternionf &q)
+{
+  Eigen::Vector3f euler;
+  float qw = q.w(), qx = q.x(), qy = q.y(), qz = q.z();
+
+  // Roll
+  float sinr_cosp = 2 * (qw * qx + qy * qz);
+  float cosr_cosp = 1 - 2 * (qx * qx + qy * qy);
+  euler.x() = std::atan2(sinr_cosp, cosr_cosp);
+
+  // Pitch
+  float sinp = 2 * (qw * qy - qz * qx);
+  if (std::abs(sinp) >= 1)
+    euler.y() = std::copysign(M_PI / 2, sinp);
+  else
+    euler.y() = std::asin(sinp);
+
+  //// ANOTHER IMPLEMENTATION VERSION
+  // float sinp = std::sqrt(1 + 2 * (qw * qy - qx * qz));
+  // float cosp = std::sqrt(1 - 2 * (qw * qy - qx * qz));
+  // euler.y()= 2 * std::atan2(sinp, cosp) - M_PI / 2;
+
+  // Yaw
+  float siny_cosp = 2 * (qw * qz + qx * qy);
+  float cosy_cosp = 1 - 2 * (qy * qy + qz * qz);
+  euler.z() = std::atan2(siny_cosp, cosy_cosp);
+
+  return euler;
 }
 
 int main(int argc, char **argv)
@@ -198,7 +235,36 @@ int main(int argc, char **argv)
 
   pcl::PointCloud<pcl::PointXYZ>::Ptr markers(new pcl::PointCloud<pcl::PointXYZ>);
 
+  // Try to smooth out velocities
+  std::unordered_map<std::string, std::deque<Eigen::Vector3f>> velocity_buffers;
+  const int VELOCITY_WINDOW_SIZE = 8;
+
+  std::unordered_map<std::string, std::deque<Eigen::Vector3f>> angular_velocity_buffers;
+  // using the same size as the linear window for now, maybe configure a different one later if it is needed
+
+  // Structures to save the data we're working with
+  std::map<std::string, std::pair<Eigen::Vector3f, rclcpp::Time>> previous_positions;
+  std::map<std::string, std::pair<Eigen::Quaternionf, rclcpp::Time>> previous_orientations;
+  std::map<std::string, std::pair<Eigen::Vector3f, rclcpp::Time>> previous_linear_vel;
+  std::map<std::string, std::pair<Eigen::Vector3f, rclcpp::Time>> previous_angular_vel;
+
+  // Variables to control and select correctly when computing at a bigger frame difference
+  std::map<std::string, int> lastFrameIDLinear;
+  std::map<std::string, int> lastFrameIDAngular;
+
+  // Unwrap the yaw angle when it makes a full circle turn
+  double yaw_err = 0.0;
+  long int currentFrameID = -1;
+
+  // At how many frames I want to compute the velocity, 1 for a per-frame basis and more for a 5/10 frame difference
+  int FRAME_DIFF = 1;
+
+  // poses_deadline variable hold the QOS for the frame frquency
+
+
   for (size_t frameId = 0; rclcpp::ok(); ++frameId) {
+
+    currentFrameID = currentFrameID + 1;
 
     // Get a frame
     mocap->waitForNextFrame();
@@ -296,6 +362,158 @@ int main(int argc, char **argv)
         msgPoses.poses[i].pose.position.y = transforms[i].transform.translation.y;
         msgPoses.poses[i].pose.position.z = transforms[i].transform.translation.z;
         msgPoses.poses[i].pose.orientation = transforms[i].transform.rotation;
+
+        Eigen::Vector3f linear_velocity = Eigen::Vector3f(0.0f, 0.0f, 0.0f);
+        Eigen::Vector3f angular_velocity = Eigen::Vector3f(0.0f, 0.0f, 0.0f);
+
+        rclcpp::Time current_time(msgPoses.header.stamp.sec, msgPoses.header.stamp.nanosec);
+
+        if (previous_positions.find(msgPoses.poses[i].name) == previous_positions.end())
+        {
+          // Add the first measurement of the position for the first frame iteration, also make the speed 0
+          previous_positions[msgPoses.poses[i].name] = {Eigen::Vector3f(transforms[i].transform.translation.x, transforms[i].transform.translation.y, transforms[i].transform.translation.z), current_time};
+          previous_linear_vel[msgPoses.poses[i].name] = {linear_velocity, current_time};
+          // Initialize the velocity buffer for this drone
+          velocity_buffers[msgPoses.poses[i].name] = std::deque<Eigen::Vector3f>();
+        }
+        else
+        {
+          if (previous_linear_vel.find(msgPoses.poses[i].name) == previous_linear_vel.end()) // this is impossible to happen, just a guard clause (because when we save the first positional data we also add the 0 measurement for speed)
+          {
+            previous_linear_vel[msgPoses.poses[i].name] = {linear_velocity, current_time};
+          }
+          else // This is the normal functioning when we compute the speeds at the frame difference that we want
+          {
+            const auto &[prev_lin_vel, prev_time] = previous_linear_vel[msgPoses.poses[i].name];
+
+            if (currentFrameID - lastFrameIDLinear[msgPoses.poses[i].name] < FRAME_DIFF)
+            {
+              linear_velocity = prev_lin_vel;
+            }
+            else
+            {
+              // COMPUTE THE NEW VELOCITY AT EVERY FRAME_DIFF FRAMES
+              const auto &[prev_position, prev_time_pos] = previous_positions[msgPoses.poses[i].name];
+              double dt = std::round((current_time - prev_time).seconds() * 1000) / 1000; // rounding to the third decimal
+
+              if (dt >= 0.009) // special case when we compute at a per-frame basis (FRAME_DIFF = 1) to make sure we divide by a positive time constant (encountered cases where this would be 0.000 because frames come in too fast)
+              {
+                linear_velocity = (Eigen::Vector3f(transforms[i].transform.translation.x,
+                                                   transforms[i].transform.translation.y,
+                                                   transforms[i].transform.translation.z) -
+                                   prev_position) /
+                                  dt;
+
+                // Add the current velocity to the buffer for smoothing
+                velocity_buffers[msgPoses.poses[i].name].push_back(linear_velocity);
+                // If the buffer exceeds the desired size, remove the oldest velocity
+                if (velocity_buffers[msgPoses.poses[i].name].size() > VELOCITY_WINDOW_SIZE)
+                  velocity_buffers[msgPoses.poses[i].name].pop_front();
+
+                // Apply the Simple Moving Average Filter
+                Eigen::Vector3f smoothed_velocity = Eigen::Vector3f::Zero();
+                for (const auto &v : velocity_buffers[msgPoses.poses[i].name])
+                  smoothed_velocity += v;
+                
+                smoothed_velocity /= velocity_buffers[msgPoses.poses[i].name].size();
+                linear_velocity = smoothed_velocity;
+
+                previous_linear_vel[msgPoses.poses[i].name] = {linear_velocity, current_time};
+                previous_positions[msgPoses.poses[i].name] = {Eigen::Vector3f(transforms[i].transform.translation.x,
+                                                                              transforms[i].transform.translation.y, transforms[i].transform.translation.z),
+                                                              current_time};
+                lastFrameIDLinear[msgPoses.poses[i].name] = currentFrameID;
+              }
+              else // When dt is too small
+              {
+                linear_velocity = prev_lin_vel;
+              }
+            }
+          }
+        }
+
+        if (previous_orientations.find(msgPoses.poses[i].name) == previous_orientations.end())
+        {
+          // Add the first measurement of the angles for the first frame iteration, also make the speed 0
+          previous_orientations[msgPoses.poses[i].name] = {Eigen::Quaternionf(transforms[i].transform.rotation.w,
+                                                                              transforms[i].transform.rotation.x, transforms[i].transform.rotation.y, transforms[i].transform.rotation.z),
+                                                           current_time};
+          previous_angular_vel[msgPoses.poses[i].name] = {angular_velocity, current_time};
+          angular_velocity_buffers[msgPoses.poses[i].name] = std::deque<Eigen::Vector3f>(); // Initialize the velocity buffer for this drone
+        }
+        else
+        {
+          if (previous_angular_vel.find(msgPoses.poses[i].name) == previous_angular_vel.end()) // this is impossible to happen, just a guard clause (because when we save the first angular data we also add the 0 measurement for speed)
+          {
+            previous_angular_vel[msgPoses.poses[i].name] = {angular_velocity, current_time};
+          }
+          else // This is the normal functioning when we compute the speeds at the frame difference that we want
+          {
+            const auto &[prev_ang_vel, prev_time] = previous_angular_vel[msgPoses.poses[i].name];
+
+            if (currentFrameID - lastFrameIDAngular[msgPoses.poses[i].name] < FRAME_DIFF)
+            {
+              angular_velocity = prev_ang_vel;
+            }
+            else
+            {
+              // COMPUTE THE NEW VELOCITY AT EVERY FRAME_DIFF FRAMES
+              const auto &[prev_orientation, _] = previous_orientations[msgPoses.poses[i].name];
+              double dt = std::round((current_time - prev_time).seconds() * 1000) / 1000;
+
+              Eigen::Vector3f prev_euler_angles = quaternionToEuler(prev_orientation);
+              Eigen::Vector3f euler_angles = quaternionToEuler(Eigen::Quaternionf(transforms[i].transform.rotation.w,
+                                                                                  transforms[i].transform.rotation.x, transforms[i].transform.rotation.y, transforms[i].transform.rotation.z));
+
+              // UNWRAP THE YAW ANGLE
+              yaw_err = euler_angles.z() - prev_euler_angles.z();
+              if (yaw_err > M_PI || yaw_err < -M_PI)
+              {
+                if (yaw_err > 0)
+                  yaw_err = -yaw_err - 2 * M_PI;
+                else
+                  yaw_err = 2 * M_PI + yaw_err;
+              }
+
+              if (dt >= 0.009) // special case when we compute at a per-frame basis (FRAME_DIFF = 1) to make sure we divide by a positive time constant (encountered cases where this would be 0.000 because frames come in too fast)
+              {
+                angular_velocity = (euler_angles - prev_euler_angles) / dt;
+                angular_velocity.z() = -yaw_err / dt;
+
+                // Add the current velocity to the buffer for smoothing
+                angular_velocity_buffers[msgPoses.poses[i].name].push_back(angular_velocity);
+                // If the buffer exceeds the desired size, remove the oldest velocity
+                if (angular_velocity_buffers[msgPoses.poses[i].name].size() > VELOCITY_WINDOW_SIZE)
+                  angular_velocity_buffers[msgPoses.poses[i].name].pop_front();
+
+                // Apply the Simple Moving Average Filter
+                Eigen::Vector3f smoothed_ang_velocity = Eigen::Vector3f::Zero();
+                for (const auto &v : angular_velocity_buffers[msgPoses.poses[i].name])
+                  smoothed_ang_velocity += v;
+
+                smoothed_ang_velocity /= angular_velocity_buffers[msgPoses.poses[i].name].size();
+                angular_velocity = smoothed_ang_velocity;
+
+                previous_angular_vel[msgPoses.poses[i].name] = {angular_velocity, current_time};
+                previous_orientations[msgPoses.poses[i].name] = {Eigen::Quaternionf(transforms[i].transform.rotation.w,
+                                                                                    transforms[i].transform.rotation.x, transforms[i].transform.rotation.y, transforms[i].transform.rotation.z),
+                                                                 current_time};
+                lastFrameIDAngular[msgPoses.poses[i].name] = currentFrameID;
+              }
+              else // When dt is too small
+              {
+                angular_velocity = prev_ang_vel;
+              }
+            }
+          }
+        }
+
+        msgPoses.poses[i].velocity.linear.x = linear_velocity.x();
+        msgPoses.poses[i].velocity.linear.y = linear_velocity.y();
+        msgPoses.poses[i].velocity.linear.z = linear_velocity.z();
+        msgPoses.poses[i].velocity.angular.x = angular_velocity.x();
+        msgPoses.poses[i].velocity.angular.y = angular_velocity.y();
+        msgPoses.poses[i].velocity.angular.z = angular_velocity.z();
       }
       pubPoses->publish(msgPoses);
 
